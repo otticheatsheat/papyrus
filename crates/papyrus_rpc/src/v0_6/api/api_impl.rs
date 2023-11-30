@@ -13,7 +13,6 @@ use papyrus_execution::{
     execution_utils,
     simulate_transactions as exec_simulate_transactions,
     ExecutionConfigByBlock,
-    ExecutionError,
 };
 use papyrus_storage::body::events::{EventIndex, EventsReader};
 use papyrus_storage::body::{BodyStorageReader, TransactionIndex};
@@ -64,8 +63,6 @@ use super::super::broadcasted_transaction::{
     BroadcastedTransaction,
 };
 use super::super::error::{
-    contract_error,
-    ContractError,
     JsonRpcError,
     TransactionExecutionError,
     BLOCK_NOT_FOUND,
@@ -109,6 +106,7 @@ use super::super::write_api_result::{
     AddInvokeOkResult,
 };
 use super::{
+    execution_error_to_error_object_owned,
     stored_txn_to_executable_txn,
     BlockHashAndNumber,
     BlockId,
@@ -907,7 +905,7 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
         let reader = self.storage_reader.clone();
         let contract_address_copy = contract_address;
 
-        let call_result = tokio::task::spawn_blocking(move || {
+        let res = tokio::task::spawn_blocking(move || {
             execute_call(
                 reader,
                 maybe_pending_data,
@@ -921,16 +919,9 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
             )
         })
         .await
-        .map_err(internal_server_error)?;
-
-        match call_result {
-            Ok(res) => Ok(res.retdata.0),
-            Err(ExecutionError::StorageError(err)) => Err(internal_server_error(err)),
-            Err(ExecutionError::ContractNotFound { .. }) => Err(CONTRACT_NOT_FOUND.into()),
-            Err(err) => {
-                Err(contract_error(ContractError { revert_error: format!("{}", err) }).into())
-            }
-        }
+        .map_err(internal_server_error)?
+        .map_err(execution_error_to_error_object_owned)?;
+        Ok(res.retdata.0)
     }
 
     #[instrument(skip(self), level = "debug", err, ret)]
@@ -1091,7 +1082,7 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
         let charge_fee = !simulation_flags.contains(&SimulationFlag::SkipFeeCharge);
         let validate = !simulation_flags.contains(&SimulationFlag::SkipValidate);
 
-        let simulate_transactions_result = tokio::task::spawn_blocking(move || {
+        let simulation_results = tokio::task::spawn_blocking(move || {
             exec_simulate_transactions(
                 executable_txns,
                 None,
@@ -1106,19 +1097,16 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
             )
         })
         .await
-        .map_err(internal_server_error)?;
+        .map_err(internal_server_error)?
+        .map_err(execution_error_to_error_object_owned)?;
 
-        match simulate_transactions_result {
-            Ok(simulation_results) => Ok(simulation_results
-                .into_iter()
-                .map(|(transaction_trace, _, gas_price, fee)| SimulatedTransaction {
-                    transaction_trace,
-                    fee_estimation: FeeEstimate::from(gas_price, fee),
-                })
-                .collect()),
-            Err(ExecutionError::StorageError(err)) => Err(internal_server_error(err)),
-            Err(err) => Err(ErrorObjectOwned::from(JsonRpcError::try_from(err)?)),
-        }
+        Ok(simulation_results
+            .into_iter()
+            .map(|(transaction_trace, _, gas_price, fee)| SimulatedTransaction {
+                transaction_trace,
+                fee_estimation: FeeEstimate::from(gas_price, fee),
+            })
+            .collect())
     }
 
     #[instrument(skip(self), level = "debug", err)]
@@ -1186,7 +1174,7 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
             let TransactionIndex(block_number, tx_offset) = storage_txn
                 .get_transaction_idx_by_hash(&transaction_hash)
                 .map_err(internal_server_error)?
-                .ok_or(INVALID_TRANSACTION_HASH)?;
+                .ok_or(TRANSACTION_HASH_NOT_FOUND)?;
 
             let casm_marker =
                 storage_txn.get_compiled_class_marker().map_err(internal_server_error)?;
@@ -1241,7 +1229,7 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
         let chain_id = self.chain_id.clone();
         let reader = self.storage_reader.clone();
 
-        let simulate_transactions_result = tokio::task::spawn_blocking(move || {
+        let mut simulation_results = tokio::task::spawn_blocking(move || {
             exec_simulate_transactions(
                 executable_transactions,
                 Some(transaction_hashes),
@@ -1256,15 +1244,10 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
             )
         })
         .await
-        .map_err(internal_server_error)?;
+        .map_err(internal_server_error)?
+        .map_err(execution_error_to_error_object_owned)?;
 
-        match simulate_transactions_result {
-            Ok(mut simulation_results) => {
-                Ok(simulation_results.pop().expect("Should have transaction exeuction result").0)
-            }
-            Err(ExecutionError::StorageError(err)) => Err(internal_server_error(err)),
-            Err(err) => Err(ErrorObjectOwned::from(JsonRpcError::try_from(err)?)),
-        }
+        Ok(simulation_results.pop().expect("Should have transaction exeuction result").0)
     }
 
     #[instrument(skip(self), level = "debug", err)]
@@ -1358,7 +1341,7 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
         let reader = self.storage_reader.clone();
         let transaction_hashes_clone = transaction_hashes.clone();
 
-        let simulate_transactions_result = tokio::task::spawn_blocking(move || {
+        let simulation_results = tokio::task::spawn_blocking(move || {
             exec_simulate_transactions(
                 executable_txns,
                 Some(transaction_hashes_clone),
@@ -1373,20 +1356,17 @@ impl JsonRpcServer for JsonRpcServerV0_6Impl {
             )
         })
         .await
-        .map_err(internal_server_error)?;
+        .map_err(internal_server_error)?
+        .map_err(execution_error_to_error_object_owned)?;
 
-        match simulate_transactions_result {
-            Ok(simulation_results) => Ok(simulation_results
-                .into_iter()
-                .zip(transaction_hashes)
-                .map(|((trace_root, _, _, _), transaction_hash)| TransactionTraceWithHash {
-                    transaction_hash,
-                    trace_root,
-                })
-                .collect()),
-            Err(ExecutionError::StorageError(err)) => Err(internal_server_error(err)),
-            Err(err) => Err(ErrorObjectOwned::from(JsonRpcError::try_from(err)?)),
-        }
+        Ok(simulation_results
+            .into_iter()
+            .zip(transaction_hashes)
+            .map(|((trace_root, _, _, _), transaction_hash)| TransactionTraceWithHash {
+                transaction_hash,
+                trace_root,
+            })
+            .collect())
     }
 }
 
